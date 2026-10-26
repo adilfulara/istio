@@ -34,11 +34,13 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core/tunnelingconfig"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/wellknown"
 )
 
 // gatewayWildcardTLSInternalName is the name of the internal listener of all wildcard DYNAMIC_DNS destinations of
@@ -126,7 +128,8 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSFilters(target gatewayWildcard
 		lb.gatewayWildcardTLSTargets = append(lb.gatewayWildcardTLSTargets, target)
 	}
 	tcpProxy := &tcp.TcpProxy{
-		StatPrefix:       target.dfpCluster,
+		// The internal chain counts the connection under the destination cluster, so this chain uses its own prefix.
+		StatPrefix:       gatewayWildcardTLSInternalName,
 		ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: gatewayWildcardTLSInternalName},
 		// The internal listener applies the idle timeout, as on waypoints. A timeout here could close the connection
 		// before the one configured for the destination.
@@ -137,7 +140,13 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSFilters(target gatewayWildcard
 		MaxEarlyDataBytes:   wrappers.UInt32(0),
 	}
 	class := model.OutboundListenerClass(lb.node.Type)
-	tcpFilter := setAccessLogAndBuildTCPFilter(lb.push, lb.node, tcpProxy, class, nil)
+	// The internal chain logs the connection, so this chain only logs failures to connect to it, as the waypoint
+	// connect forwarder does.
+	accessLogBuilder.setHboneOriginationAccessLog(lb.push, lb.node, tcpProxy, class)
+	tcpFilter := &listener.Filter{
+		Name:       wellknown.TCPProxy,
+		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(tcpProxy)},
+	}
 	return lb.buildCompleteNetworkFiltersWithAuthz(class, port.Port, []*listener.Filter{
 		xdsfilters.GatewayDownstreamPeerFilter,
 		xdsfilters.BuildGatewayWildcardTLSTargetFilter(key),

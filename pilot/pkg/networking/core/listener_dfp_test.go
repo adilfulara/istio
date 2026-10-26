@@ -36,6 +36,7 @@ import (
 
 	networking "istio.io/api/networking/v1alpha3"
 	security "istio.io/api/security/v1beta1"
+	telemetry "istio.io/api/telemetry/v1alpha1"
 	"istio.io/api/type/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
@@ -43,6 +44,7 @@ import (
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
@@ -1098,6 +1100,66 @@ func TestGatewayWildcardDynamicDNSTunnel(t *testing.T) {
 			g.Expect(tcpProxy.GetCluster()).To(Equal("outbound|443||*.wikipedia.org"))
 			g.Expect(tcpProxy.GetTunnelingConfig().GetHostname()).To(Equal("proxy.corp:3128"))
 		})
+	}
+}
+
+// TestGatewayWildcardDynamicDNSAccessLog tests that each connection is logged once. The ISTIO_MUTUAL gateway chain
+// logs only failures to connect to the internal listener, as the waypoint connect forwarder does, and the internal
+// chain logs the connection to the external host. The PASSTHROUGH chain has one TCP proxy, which logs every connection.
+func TestGatewayWildcardDynamicDNSAccessLog(t *testing.T) {
+	telemetryConfig := config.Config{
+		Meta: config.Meta{GroupVersionKind: gvk.Telemetry, Name: "mesh-default", Namespace: "istio-system"},
+		Spec: &telemetry.Telemetry{
+			AccessLogging: []*telemetry.AccessLogging{{Providers: []*telemetry.ProviderRef{{Name: "envoy"}}}},
+		},
+	}
+	sources := []struct {
+		name      string
+		telemetry bool
+	}{
+		{name: "mesh config access log file"},
+		{name: "Telemetry provider", telemetry: true},
+	}
+	for _, mode := range []networking.ServerTLSSettings_TLSmode{networking.ServerTLSSettings_PASSTHROUGH, networking.ServerTLSSettings_ISTIO_MUTUAL} {
+		for _, source := range sources {
+			t.Run(mode.String()+"/"+source.name, func(t *testing.T) {
+				g := NewWithT(t)
+				test.SetForTest(t, &features.EnableWildcardHostServiceEntriesForTLS, true)
+				accessLogBuilder.reset()
+				m := mesh.DefaultMeshConfig()
+				configs := gatewayWildcardModeConfigs(mode)
+				if source.telemetry {
+					configs = append(configs, telemetryConfig)
+				} else {
+					m.AccessLogFile = "/dev/stdout"
+				}
+				cg := NewConfigGenTest(t, TestOptions{Configs: configs, MeshConfig: m})
+				proxy := cg.SetupProxy(&model.Proxy{
+					Type:     model.Router,
+					Labels:   map[string]string{"istio": "egressgateway"},
+					Metadata: &model.NodeMetadata{Labels: map[string]string{"istio": "egressgateway"}, Namespace: "istio-system"},
+				})
+				listeners := cg.Listeners(proxy)
+
+				dfpTCP := xdstest.ExtractTCPProxy(t, gatewayWildcardDFPChain(t, listeners, mode))
+				g.Expect(dfpTCP.GetAccessLog()).NotTo(BeEmpty())
+				for _, al := range dfpTCP.GetAccessLog() {
+					g.Expect(al.GetFilter()).To(BeNil())
+				}
+				if mode != networking.ServerTLSSettings_ISTIO_MUTUAL {
+					return
+				}
+
+				outerTCP := xdstest.ExtractTCPProxy(t, findMutualTLSChain(t, listeners, "*.wikipedia.org"))
+				g.Expect(outerTCP.GetAccessLog()).NotTo(BeEmpty())
+				for _, al := range outerTCP.GetAccessLog() {
+					g.Expect(al.GetFilter().GetResponseFlagFilter().GetFlags()).To(Equal([]string{"UF"}))
+				}
+				// The TCP proxy stats of the two chains are not counted twice under the same prefix.
+				g.Expect(outerTCP.GetStatPrefix()).To(Equal(gatewayWildcardTLSInternalName))
+				g.Expect(dfpTCP.GetStatPrefix()).To(Equal("outbound|443||*.wikipedia.org"))
+			})
+		}
 	}
 }
 
