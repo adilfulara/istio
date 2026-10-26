@@ -31,6 +31,7 @@ import (
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/match"
 	istio_route "istio.io/istio/pilot/pkg/networking/core/route"
+	"istio.io/istio/pilot/pkg/networking/core/tunnelingconfig"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/util"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
@@ -214,6 +215,7 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSInternalFilters(
 		tcpProxy.IdleTimeout = parseDuration(lb.node.Metadata.IdleTimeout)
 	}
 	maybeSetHashPolicy(destinationRule, tcpProxy, target.subset)
+	tunnelingconfig.Apply(tcpProxy, destinationRule, target.subset)
 	tcpFilter := setAccessLogAndBuildTCPFilter(lb.push, lb.node, tcpProxy, istionetworking.ListenerClassGateway, nil)
 
 	return append(lb.copyFilters(authzFilters),

@@ -1004,6 +1004,103 @@ func TestGatewayMutualTLSWildcardIdleTimeout(t *testing.T) {
 	}
 }
 
+// gatewayWildcardModeConfigs returns a gateway server in the given TLS mode that routes to the wildcard DYNAMIC_DNS
+// ServiceEntry *.wikipedia.org, with a TLS route for PASSTHROUGH and a TCP route for ISTIO_MUTUAL.
+func gatewayWildcardModeConfigs(mode networking.ServerTLSSettings_TLSmode) []config.Config {
+	const wildcard = "*.wikipedia.org"
+	route := []*networking.RouteDestination{{Destination: &networking.Destination{Host: wildcard, Port: &networking.PortSelector{Number: 443}}}}
+	vs := &networking.VirtualService{Hosts: []string{wildcard}, Gateways: []string{"egressgateway"}}
+	if mode == networking.ServerTLSSettings_PASSTHROUGH {
+		vs.Tls = []*networking.TLSRoute{{
+			Match: []*networking.TLSMatchAttributes{{Port: 443, SniHosts: []string{wildcard}, Gateways: []string{"egressgateway"}}},
+			Route: route,
+		}}
+	} else {
+		vs.Tcp = []*networking.TCPRoute{{
+			Match: []*networking.L4MatchAttributes{{Port: 443, Gateways: []string{"egressgateway"}}},
+			Route: route,
+		}}
+	}
+	return []config.Config{
+		{
+			Meta: config.Meta{GroupVersionKind: gvk.ServiceEntry, Name: "wikipedia", Namespace: "istio-system"},
+			Spec: &networking.ServiceEntry{
+				Hosts:      []string{wildcard},
+				Ports:      []*networking.ServicePort{{Number: 443, Name: "tls", Protocol: "TLS"}},
+				Location:   networking.ServiceEntry_MESH_EXTERNAL,
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+		},
+		{
+			Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: "egressgateway", Namespace: "istio-system"},
+			Spec: &networking.Gateway{
+				Selector: map[string]string{"istio": "egressgateway"},
+				Servers: []*networking.Server{{
+					Port:  &networking.Port{Number: 443, Name: "tls-wikipedia", Protocol: "TLS"},
+					Hosts: []string{wildcard},
+					Tls:   &networking.ServerTLSSettings{Mode: mode},
+				}},
+			},
+		},
+		{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: "wikipedia", Namespace: "istio-system"},
+			Spec: vs,
+		},
+	}
+}
+
+// gatewayWildcardDFPChain returns the chain whose TCP proxy sends to the dynamic forward proxy cluster: the
+// PASSTHROUGH chain, or the ISTIO_MUTUAL internal chain.
+func gatewayWildcardDFPChain(t *testing.T, listeners []*listener.Listener, mode networking.ServerTLSSettings_TLSmode) *listener.FilterChain {
+	if mode == networking.ServerTLSSettings_ISTIO_MUTUAL {
+		inner := xdstest.ExtractListener(gatewayWildcardTLSInternalName, listeners)
+		if inner == nil {
+			return nil
+		}
+		fc, _ := gatewayWildcardTLSChain(t, inner, "*.wikipedia.org:443")
+		return fc
+	}
+	for _, l := range listeners {
+		for _, fc := range l.FilterChains {
+			if slices.Contains(fc.GetFilterChainMatch().GetServerNames(), "*.wikipedia.org") {
+				return fc
+			}
+		}
+	}
+	return nil
+}
+
+// TestGatewayWildcardDynamicDNSTunnel tests that both TLS modes apply the DestinationRule tunnel settings to the TCP
+// proxy that sends to the dynamic forward proxy cluster, as sidecars and waypoints do.
+func TestGatewayWildcardDynamicDNSTunnel(t *testing.T) {
+	destinationRule := config.Config{
+		Meta: config.Meta{GroupVersionKind: gvk.DestinationRule, Name: "wikipedia", Namespace: "istio-system"},
+		Spec: &networking.DestinationRule{
+			Host: "*.wikipedia.org",
+			TrafficPolicy: &networking.TrafficPolicy{
+				Tunnel: &networking.TrafficPolicy_TunnelSettings{Protocol: "CONNECT", TargetHost: "proxy.corp", TargetPort: 3128},
+			},
+		},
+	}
+	for _, mode := range []networking.ServerTLSSettings_TLSmode{networking.ServerTLSSettings_PASSTHROUGH, networking.ServerTLSSettings_ISTIO_MUTUAL} {
+		t.Run(mode.String(), func(t *testing.T) {
+			g := NewWithT(t)
+			test.SetForTest(t, &features.EnableWildcardHostServiceEntriesForTLS, true)
+			cg := NewConfigGenTest(t, TestOptions{Configs: append(gatewayWildcardModeConfigs(mode), destinationRule)})
+			proxy := cg.SetupProxy(&model.Proxy{
+				Type:     model.Router,
+				Labels:   map[string]string{"istio": "egressgateway"},
+				Metadata: &model.NodeMetadata{Labels: map[string]string{"istio": "egressgateway"}, Namespace: "istio-system"},
+			})
+			fc := gatewayWildcardDFPChain(t, cg.Listeners(proxy), mode)
+			g.Expect(fc).NotTo(BeNil())
+			tcpProxy := xdstest.ExtractTCPProxy(t, fc)
+			g.Expect(tcpProxy.GetCluster()).To(Equal("outbound|443||*.wikipedia.org"))
+			g.Expect(tcpProxy.GetTunnelingConfig().GetHostname()).To(Equal("proxy.corp:3128"))
+		})
+	}
+}
+
 func findMutualTLSChain(t *testing.T, listeners []*listener.Listener, sni string) *listener.FilterChain {
 	for _, l := range listeners {
 		for _, fc := range l.FilterChains {
