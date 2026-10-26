@@ -249,7 +249,7 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSInternalListener() *listener.L
 			}},
 		})
 	}
-	return &listener.Listener{
+	l := &listener.Listener{
 		Name:              gatewayWildcardTLSInternalName,
 		ListenerSpecifier: &listener.Listener_InternalListener{InternalListener: &listener.Listener_InternalListenerConfig{}},
 		ListenerFilters:   []*listener.ListenerFilter{xdsfilters.OriginalDestination, xdsfilters.TLSInspector},
@@ -262,6 +262,10 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSInternalListener() *listener.L
 			}},
 		},
 	}
+	// The gateway chain only logs failures to connect here, so log the connections that match no chain, as the
+	// waypoint main_internal listener does.
+	accessLogBuilder.setListenerAccessLog(lb.push, lb.node, l, istionetworking.ListenerClassGateway)
+	return l
 }
 
 // buildGatewayWildcardTLSInternalFilters builds the network filters of the internal chain of a target, after the

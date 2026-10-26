@@ -1163,6 +1163,13 @@ func TestGatewayWildcardDynamicDNSAccessLog(t *testing.T) {
 				for _, al := range outerTCP.GetAccessLog() {
 					g.Expect(al.GetFilter().GetResponseFlagFilter().GetFlags()).To(Equal([]string{"UF"}))
 				}
+				// A connection that matches no internal chain, such as an SNI that the server hosts do not allow, is logged
+				// by the internal listener, as on the waypoint main_internal listener.
+				inner := xdstest.ExtractListener(gatewayWildcardTLSInternalName, listeners)
+				g.Expect(inner.GetAccessLog()).NotTo(BeEmpty())
+				for _, al := range inner.GetAccessLog() {
+					g.Expect(al.GetFilter().GetResponseFlagFilter().GetFlags()).To(Equal([]string{"NR"}))
+				}
 				// The TCP proxy stats of the two chains are not counted twice under the same prefix.
 				g.Expect(outerTCP.GetStatPrefix()).To(Equal(gatewayWildcardTLSInternalName))
 				g.Expect(dfpTCP.GetStatPrefix()).To(Equal("outbound|443||*.wikipedia.org"))
