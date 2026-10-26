@@ -548,6 +548,290 @@ func TestEgressGatewayMutualTLSWildcardDynamicDNSRejectsOtherSNI(t *testing.T) {
 		})
 }
 
+// narrowServerWildcardHost is a wildcard host that covers both the external echo and the other client, so the gateway
+// server hosts, not the ServiceEntry host, decide which of them the gateway forwards to.
+const narrowServerWildcardHost = "*.svc.cluster.local"
+
+// routeViaNarrowEgressGateway sends TLS traffic for the host to a passthrough gateway server that only lists the
+// host. The gateway route has a rule for the whole wildcard host, which is wider than the server, and one for the host.
+const routeViaNarrowEgressGateway = `
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: wildcard-external
+spec:
+  hosts:
+  - "{{.WildcardHost}}"
+  ports:
+  - number: 443
+    name: tls
+    protocol: TLS
+  location: MESH_EXTERNAL
+  resolution: DYNAMIC_DNS
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: wildcard-egress
+spec:
+  selector:
+    istio: {{.EgressLabel}}
+  servers:
+  - port:
+      number: {{.ServerPort}}
+      name: tls
+      protocol: TLS
+    hosts:
+    - "{{.Host}}"
+    tls:
+      mode: PASSTHROUGH
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: host-via-egress-gateway
+spec:
+  hosts:
+  - "{{.Host}}"
+  tls:
+  - match:
+    - port: 443
+      sniHosts: ["{{.Host}}"]
+    route:
+    - destination:
+        host: {{.EgressService}}.{{.EgressNamespace}}.svc.cluster.local
+        port:
+          number: {{.ServerPort}}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: wildcard-at-egress-gateway
+spec:
+  hosts:
+  - "{{.WildcardHost}}"
+  gateways:
+  - wildcard-egress
+  tls:
+  - match:
+    - port: {{.ServerPort}}
+      sniHosts: ["{{.WildcardHost}}"]
+    route:
+    - destination:
+        host: "{{.WildcardHost}}"
+        port:
+          number: {{.RoutePort}}
+  - match:
+    - port: {{.ServerPort}}
+      sniHosts: ["{{.Host}}"]
+    route:
+    - destination:
+        host: "{{.WildcardHost}}"
+        port:
+          number: {{.RoutePort}}
+`
+
+func TestEgressGatewayWildcardDynamicDNSRejectsSNIOutsideServerHosts(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			client := match.ServiceName(echo.NamespacedName{Name: "client", Namespace: apps.Namespace}).GetMatches(apps.All.Instances())
+			other := match.ServiceName(echo.NamespacedName{Name: "other-client", Namespace: apps.Namespace}).GetMatches(apps.All.Instances())
+			if len(client) == 0 || len(other) == 0 {
+				t.Fatal("client echoes not found")
+			}
+			if !hasIPv4(t, client) {
+				t.Skip("TODO: skipping test as wildcard DNS doesn't support resolving to IPv6 address")
+			}
+
+			host := apps.External.All.Config().ClusterLocalFQDN()
+			// other-client serves TLS on port 443 under the wildcard host, outside the server hosts.
+			otherHost := other.Config().ClusterLocalFQDN()
+			settings := i.Settings()
+			args := map[string]string{
+				"WildcardHost":    narrowServerWildcardHost,
+				"Host":            host,
+				"OtherHost":       otherHost,
+				"EgressLabel":     settings.EgressGatewayIstioLabel,
+				"EgressService":   settings.EgressGatewayServiceName,
+				"EgressNamespace": settings.EgressGatewayServiceNamespace,
+				"ServerPort":      "443",
+				"RoutePort":       "443",
+			}
+			t.NewSubTest("other host reachable without the egress gateway").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(otherHost, check.OK()))
+				}
+			})
+			// The other host is sent to the same gateway server, where only rules wider than the server hosts match it.
+			t.ConfigIstio().Eval(apps.Namespace.Name(), args, routeViaNarrowEgressGateway).ApplyOrFail(t)
+			t.ConfigIstio().Eval(apps.Namespace.Name(), args, routeOtherHostViaEgressGateway).ApplyOrFail(t)
+
+			// Barrier: calls fail only once they go through the egress gateway.
+			deny := t.ConfigIstio().Eval(settings.EgressGatewayServiceNamespace, args, denySNIAtEgressGateway)
+			deny.ApplyOrFail(t, apply.NoCleanup)
+			t.NewSubTest("both hosts denied by AuthorizationPolicy at egress gateway").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(host, check.Error()))
+					c.CallOrFail(t, httpsCall(otherHost, check.Error()))
+				}
+			})
+			deny.DeleteOrFail(t)
+			t.NewSubTest("server host reaches the gateway destination").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(host, check.OK()))
+				}
+			})
+			t.NewSubTest("host outside the server hosts is not forwarded").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(otherHost, check.Error()))
+				}
+			})
+		})
+}
+
+// routeViaNarrowEgressGatewayMutualTLS sends TLS traffic for the host to an ISTIO_MUTUAL gateway server that only
+// lists the host, and whose TCP route sends to the whole wildcard host.
+const routeViaNarrowEgressGatewayMutualTLS = `
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: wildcard-external-mtls
+spec:
+  hosts:
+  - "{{.WildcardHost}}"
+  ports:
+  - number: 443
+    name: tls
+    protocol: TLS
+  location: MESH_EXTERNAL
+  resolution: DYNAMIC_DNS
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: wildcard-egress-mtls
+spec:
+  selector:
+    istio: {{.EgressLabel}}
+  servers:
+  - port:
+      number: {{.ServerPort}}
+      name: tls-mtls
+      protocol: TLS
+    hosts:
+    - "{{.Host}}"
+    tls:
+      mode: ISTIO_MUTUAL
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: wildcard-egress-mtls
+spec:
+  host: {{.EgressService}}.{{.EgressNamespace}}.svc.cluster.local
+  subsets:
+  - name: wildcard
+    trafficPolicy:
+      tls:
+        mode: ISTIO_MUTUAL
+        sni: "{{.GatewaySNI}}"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: host-via-egress-gateway-mtls
+spec:
+  hosts:
+  - "{{.Host}}"
+  tls:
+  - match:
+    - port: 443
+      sniHosts: ["{{.Host}}"]
+    route:
+    - destination:
+        host: {{.EgressService}}.{{.EgressNamespace}}.svc.cluster.local
+        subset: wildcard
+        port:
+          number: {{.ServerPort}}
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: wildcard-at-egress-gateway-mtls
+spec:
+  hosts:
+  - "{{.WildcardHost}}"
+  gateways:
+  - wildcard-egress-mtls
+  tcp:
+  - match:
+    - port: {{.ServerPort}}
+    route:
+    - destination:
+        host: "{{.WildcardHost}}"
+        port:
+          number: {{.RoutePort}}
+`
+
+func TestEgressGatewayMutualTLSWildcardDynamicDNSRejectsSNIOutsideServerHosts(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			client := match.ServiceName(echo.NamespacedName{Name: "client", Namespace: apps.Namespace}).GetMatches(apps.All.Instances())
+			other := match.ServiceName(echo.NamespacedName{Name: "other-client", Namespace: apps.Namespace}).GetMatches(apps.All.Instances())
+			if len(client) == 0 || len(other) == 0 {
+				t.Fatal("client echoes not found")
+			}
+			if !hasIPv4(t, client) {
+				t.Skip("TODO: skipping test as wildcard DNS doesn't support resolving to IPv6 address")
+			}
+
+			host := apps.External.All.Config().ClusterLocalFQDN()
+			// other-client serves TLS on port 443 under the wildcard host, outside the server hosts.
+			otherHost := other.Config().ClusterLocalFQDN()
+			settings := i.Settings()
+			args := map[string]string{
+				"WildcardHost": narrowServerWildcardHost,
+				// The mesh SNI must match the server hosts; the application SNI inside the mTLS chooses the upstream.
+				"GatewaySNI":      host,
+				"Host":            host,
+				"OtherHost":       otherHost,
+				"EgressLabel":     settings.EgressGatewayIstioLabel,
+				"EgressService":   settings.EgressGatewayServiceName,
+				"EgressNamespace": settings.EgressGatewayServiceNamespace,
+				"ServerPort":      "443",
+				"RoutePort":       "443",
+			}
+			t.NewSubTest("other host reachable without the egress gateway").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(otherHost, check.OK()))
+				}
+			})
+			t.ConfigIstio().Eval(apps.Namespace.Name(), args,
+				routeViaNarrowEgressGatewayMutualTLS, routeOtherHostViaEgressGatewayMutualTLS).ApplyOrFail(t)
+
+			// Barrier: calls fail only once they go through the egress gateway.
+			deny := t.ConfigIstio().Eval(settings.EgressGatewayServiceNamespace, args, denySNIAtEgressGateway)
+			deny.ApplyOrFail(t, apply.NoCleanup)
+			t.NewSubTest("both hosts denied by AuthorizationPolicy at egress gateway").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(host, check.Error()))
+					c.CallOrFail(t, httpsCall(otherHost, check.Error()))
+				}
+			})
+			deny.DeleteOrFail(t)
+			t.NewSubTest("server host reaches the gateway destination").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(host, check.OK()))
+				}
+			})
+			t.NewSubTest("host outside the server hosts is not forwarded").Run(func(t framework.TestContext) {
+				for _, c := range client {
+					c.CallOrFail(t, httpsCall(otherHost, check.Error()))
+				}
+			})
+		})
+}
+
 // applySubset applies the DestinationRule subset of the wildcard host, if the case has one.
 func applySubset(t framework.TestContext, args map[string]string) {
 	if args["Subset"] != "" {

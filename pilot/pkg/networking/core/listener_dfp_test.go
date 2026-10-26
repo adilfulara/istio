@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	matcher "github.com/cncf/xds/go/xds/type/matcher/v3"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	dfpcluster "github.com/envoyproxy/go-control-plane/envoy/extensions/clusters/dynamic_forward_proxy/v3"
@@ -1009,12 +1010,19 @@ func TestGatewayMutualTLSWildcardIdleTimeout(t *testing.T) {
 // gatewayWildcardModeConfigs returns a gateway server in the given TLS mode that routes to the wildcard DYNAMIC_DNS
 // ServiceEntry *.wikipedia.org, with a TLS route for PASSTHROUGH and a TCP route for ISTIO_MUTUAL.
 func gatewayWildcardModeConfigs(mode networking.ServerTLSSettings_TLSmode) []config.Config {
+	wildcard := []string{"*.wikipedia.org"}
+	return gatewayWildcardServerConfigs(mode, wildcard, wildcard, wildcard)
+}
+
+// gatewayWildcardServerConfigs is gatewayWildcardModeConfigs with the given server hosts, VirtualService hosts and,
+// for PASSTHROUGH, SNI hosts.
+func gatewayWildcardServerConfigs(mode networking.ServerTLSSettings_TLSmode, serverHosts, vsHosts, sniHosts []string) []config.Config {
 	const wildcard = "*.wikipedia.org"
 	route := []*networking.RouteDestination{{Destination: &networking.Destination{Host: wildcard, Port: &networking.PortSelector{Number: 443}}}}
-	vs := &networking.VirtualService{Hosts: []string{wildcard}, Gateways: []string{"egressgateway"}}
+	vs := &networking.VirtualService{Hosts: vsHosts, Gateways: []string{"egressgateway"}}
 	if mode == networking.ServerTLSSettings_PASSTHROUGH {
 		vs.Tls = []*networking.TLSRoute{{
-			Match: []*networking.TLSMatchAttributes{{Port: 443, SniHosts: []string{wildcard}, Gateways: []string{"egressgateway"}}},
+			Match: []*networking.TLSMatchAttributes{{Port: 443, SniHosts: sniHosts, Gateways: []string{"egressgateway"}}},
 			Route: route,
 		}}
 	} else {
@@ -1039,7 +1047,7 @@ func gatewayWildcardModeConfigs(mode networking.ServerTLSSettings_TLSmode) []con
 				Selector: map[string]string{"istio": "egressgateway"},
 				Servers: []*networking.Server{{
 					Port:  &networking.Port{Number: 443, Name: "tls-wikipedia", Protocol: "TLS"},
-					Hosts: []string{wildcard},
+					Hosts: serverHosts,
 					Tls:   &networking.ServerTLSSettings{Mode: mode},
 				}},
 			},
@@ -1161,6 +1169,172 @@ func TestGatewayWildcardDynamicDNSAccessLog(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestGatewayWildcardDynamicDNSServerHosts tests that both TLS modes forward only SNIs that the gateway server hosts
+// allow. A server host narrower than the wildcard host limits the SNIs, so a route cannot widen the server.
+func TestGatewayWildcardDynamicDNSServerHosts(t *testing.T) {
+	wildcard := []string{"*.wikipedia.org"}
+	cases := []struct {
+		name        string
+		serverHosts []string
+		vsHosts     []string
+		// sniHosts are the PASSTHROUGH route SNI hosts.
+		sniHosts []string
+		// wantPassthrough are the server names of the PASSTHROUGH chain, nil if the rule is skipped.
+		wantPassthrough []string
+		// wantMutual are the SNIs that the ISTIO_MUTUAL internal chain accepts, nil if there is no internal chain.
+		wantMutual []string
+	}{
+		{
+			name:            "server host is the wildcard host",
+			serverHosts:     wildcard,
+			vsHosts:         wildcard,
+			sniHosts:        wildcard,
+			wantPassthrough: wildcard,
+			wantMutual:      []string{"suffix:.wikipedia.org"},
+		},
+		{
+			name:            "server host covers the wildcard host",
+			serverHosts:     []string{"*"},
+			vsHosts:         wildcard,
+			sniHosts:        wildcard,
+			wantPassthrough: wildcard,
+			wantMutual:      []string{"suffix:.wikipedia.org"},
+		},
+		{
+			name:        "server host narrower than the route",
+			serverHosts: []string{"en.wikipedia.org"},
+			vsHosts:     wildcard,
+			sniHosts:    wildcard,
+			wantMutual:  []string{"exact:en.wikipedia.org"},
+		},
+		{
+			name:        "namespaced server host narrower than the route",
+			serverHosts: []string{"istio-system/en.wikipedia.org"},
+			vsHosts:     wildcard,
+			sniHosts:    wildcard,
+			wantMutual:  []string{"exact:en.wikipedia.org"},
+		},
+		{
+			name:            "route SNI hosts within narrow server hosts",
+			serverHosts:     []string{"en.wikipedia.org", "*.m.wikipedia.org"},
+			vsHosts:         wildcard,
+			sniHosts:        []string{"en.wikipedia.org"},
+			wantPassthrough: []string{"en.wikipedia.org"},
+			wantMutual:      []string{"exact:en.wikipedia.org", "suffix:.m.wikipedia.org"},
+		},
+		{
+			name:        "server host outside the wildcard host",
+			serverHosts: []string{"api.example.org"},
+			vsHosts:     []string{"api.example.org"},
+			sniHosts:    wildcard,
+		},
+	}
+	for _, mode := range []networking.ServerTLSSettings_TLSmode{networking.ServerTLSSettings_PASSTHROUGH, networking.ServerTLSSettings_ISTIO_MUTUAL} {
+		for _, tt := range cases {
+			t.Run(mode.String()+"/"+tt.name, func(t *testing.T) {
+				g := NewWithT(t)
+				test.SetForTest(t, &features.EnableWildcardHostServiceEntriesForTLS, true)
+				cg := NewConfigGenTest(t, TestOptions{Configs: gatewayWildcardServerConfigs(mode, tt.serverHosts, tt.vsHosts, tt.sniHosts)})
+				proxy := cg.SetupProxy(&model.Proxy{
+					Type:     model.Router,
+					Labels:   map[string]string{"istio": "egressgateway"},
+					Metadata: &model.NodeMetadata{Labels: map[string]string{"istio": "egressgateway"}, Namespace: "istio-system"},
+				})
+				listeners := cg.Listeners(proxy)
+				xdstest.ValidateListeners(t, listeners)
+
+				if mode == networking.ServerTLSSettings_PASSTHROUGH {
+					var got []string
+					for _, l := range listeners {
+						for _, fc := range l.FilterChains {
+							if slices.Contains(filterNames(fc), wellknown.SNIDynamicForwardProxy) {
+								got = append(got, fc.GetFilterChainMatch().GetServerNames()...)
+							}
+						}
+					}
+					g.Expect(got).To(Equal(tt.wantPassthrough))
+					return
+				}
+				g.Expect(gatewayWildcardTLSAllowedSNIs(xdstest.ExtractListener(gatewayWildcardTLSInternalName, listeners))).
+					To(Equal(tt.wantMutual))
+			})
+		}
+	}
+}
+
+// TestGatewayMutualTLSWildcardServersShareChain tests that ISTIO_MUTUAL servers with different hosts that send to the
+// same destination each keep their own SNI limit, and share one internal chain.
+func TestGatewayMutualTLSWildcardServersShareChain(t *testing.T) {
+	g := NewWithT(t)
+	test.SetForTest(t, &features.EnableWildcardHostServiceEntriesForTLS, true)
+	configs := gatewayWildcardServerConfigs(networking.ServerTLSSettings_ISTIO_MUTUAL,
+		[]string{"*.wikipedia.org"}, []string{"*.wikipedia.org"}, nil)
+	gw := configs[1].Spec.(*networking.Gateway)
+	gw.Servers = append(gw.Servers, &networking.Server{
+		Port:  &networking.Port{Number: 8443, Name: "tls-en-wikipedia", Protocol: "TLS"},
+		Hosts: []string{"en.wikipedia.org"},
+		Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_ISTIO_MUTUAL},
+	})
+	vs := configs[2].Spec.(*networking.VirtualService)
+	vs.Tcp = append(vs.Tcp, &networking.TCPRoute{
+		Match: []*networking.L4MatchAttributes{{Port: 8443, Gateways: []string{"egressgateway"}}},
+		Route: vs.Tcp[0].Route,
+	})
+	cg := NewConfigGenTest(t, TestOptions{Configs: configs})
+	proxy := cg.SetupProxy(&model.Proxy{
+		Type:     model.Router,
+		Labels:   map[string]string{"istio": "egressgateway"},
+		Metadata: &model.NodeMetadata{Labels: map[string]string{"istio": "egressgateway"}, Namespace: "istio-system"},
+	})
+	listeners := cg.Listeners(proxy)
+	xdstest.ValidateListeners(t, listeners)
+
+	inner := xdstest.ExtractListener(gatewayWildcardTLSInternalName, listeners)
+	g.Expect(inner).NotTo(BeNil())
+	g.Expect(inner.FilterChains).To(HaveLen(1))
+	wide, suffix := gatewayWildcardTLSChain(t, inner, "*.wikipedia.org:443")
+	g.Expect(wide).NotTo(BeNil())
+	g.Expect(suffix).To(Equal(".wikipedia.org"))
+	narrow := inner.GetFilterChainMatcher().GetMatcherTree().GetExactMatchMap().GetMap()["*.wikipedia.org:443|en.wikipedia.org"]
+	g.Expect(narrow).NotTo(BeNil())
+	predicate := narrow.GetMatcher().GetMatcherList().GetMatchers()[0].GetPredicate().GetSinglePredicate()
+	g.Expect(predicate.GetValueMatch().GetExact()).To(Equal("en.wikipedia.org"))
+	for _, l := range listeners {
+		for _, fc := range l.FilterChains {
+			if handedOffValue(fc, xdsfilters.GatewayWildcardTLSTargetFilterStateKey) != "" {
+				g.Expect(handedOffValue(fc, xdsfilters.GatewayWildcardTLSTargetFilterStateKey)).
+					To(BeElementOf("*.wikipedia.org:443", "*.wikipedia.org:443|en.wikipedia.org"))
+			}
+		}
+	}
+}
+
+// gatewayWildcardTLSAllowedSNIs returns the SNIs that the internal listener accepts for any target, as
+// "exact:<host>" or "suffix:<suffix>", sorted.
+func gatewayWildcardTLSAllowedSNIs(l *listener.Listener) []string {
+	if l == nil {
+		return nil
+	}
+	var got []string
+	for _, onMatch := range l.GetFilterChainMatcher().GetMatcherTree().GetExactMatchMap().GetMap() {
+		for _, m := range onMatch.GetMatcher().GetMatcherList().GetMatchers() {
+			predicates := []*matcher.Matcher_MatcherList_Predicate{m.GetPredicate()}
+			if or := m.GetPredicate().GetOrMatcher(); or != nil {
+				predicates = or.GetPredicate()
+			}
+			for _, p := range predicates {
+				vm := p.GetSinglePredicate().GetValueMatch()
+				if vm.GetExact() != "" {
+					got = append(got, "exact:"+vm.GetExact())
+				} else {
+					got = append(got, "suffix:"+vm.GetSuffix())
+				}
+			}
+		}
+	}
+	return sets.SortedList(sets.New(got...))
 }
 
 func findMutualTLSChain(t *testing.T, listeners []*listener.Listener, sni string) *listener.FilterChain {

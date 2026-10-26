@@ -38,6 +38,7 @@ import (
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
@@ -57,6 +58,8 @@ type gatewayWildcardTLSTarget struct {
 	dfpCluster string
 	// subset is the route destination subset.
 	subset string
+	// sniHosts are the SNIs that the server hosts allow, under the wildcard host.
+	sniHosts []string
 }
 
 // name is the name of the filter chain of the target on the internal listener.
@@ -65,10 +68,14 @@ func (t gatewayWildcardTLSTarget) name() string {
 }
 
 // key identifies the target to the internal listener, as "<host>:<port>", or "<host>:<port>/<subset>" for a subset.
+// When the server hosts allow only some SNIs under the wildcard host, they are added as "|<sni>,<sni>".
 func (t gatewayWildcardTLSTarget) key() string {
 	key := string(t.service.Hostname) + ":" + strconv.Itoa(t.port)
 	if t.subset != "" {
 		key += "/" + t.subset
+	}
+	if len(t.sniHosts) != 1 || t.sniHosts[0] != string(t.service.Hostname) {
+		key += "|" + strings.Join(t.sniHosts, ",")
 	}
 	return key
 }
@@ -90,15 +97,40 @@ func gatewayWildcardDestination(
 	return svc, port
 }
 
-// sniHostsUnder returns true if there are SNI hosts and all of them are under the wildcard host.
-func sniHostsUnder(sniHosts []string, wildcardHost host.Name) bool {
-	return len(sniHosts) > 0 && !slices.ContainsFunc(sniHosts, func(h string) bool { return !host.Name(h).SubsetOf(wildcardHost) })
+// gatewayWildcardServerSNIHosts returns the SNIs under the wildcard host that the server hosts allow for a
+// VirtualService in the given namespace: a server host under the wildcard host, or the wildcard host itself when a
+// server host covers it.
+func gatewayWildcardServerSNIHosts(server *networking.Server, namespace string, wildcardHost host.Name) []string {
+	allowed := sets.New[string]()
+	for _, h := range server.Hosts {
+		if ns, name, ok := strings.Cut(h, "/"); ok {
+			// Gateway merging leaves only "<namespace>/<host>".
+			if ns != namespace {
+				continue
+			}
+			h = name
+		}
+		switch {
+		case wildcardHost.SubsetOf(host.Name(h)):
+			return []string{string(wildcardHost)}
+		case host.Name(h).SubsetOf(wildcardHost):
+			allowed.Insert(h)
+		}
+	}
+	return sets.SortedList(allowed)
 }
 
-// gatewayWildcardTLSTargetForServer returns the target of an ISTIO_MUTUAL TLS server whose routes send to a
-// wildcard DYNAMIC_DNS service.
+// sniHostsUnder returns true if there are SNI hosts and all of them are under one of the allowed hosts.
+func sniHostsUnder(sniHosts []string, allowed []string) bool {
+	return len(sniHosts) > 0 && !slices.ContainsFunc(sniHosts, func(h string) bool {
+		return !slices.ContainsFunc(allowed, func(a string) bool { return host.Name(h).SubsetOf(host.Name(a)) })
+	})
+}
+
+// gatewayWildcardTLSTargetForServer returns the target of an ISTIO_MUTUAL TLS server whose routes, from a
+// VirtualService in the given namespace, send to a wildcard DYNAMIC_DNS service.
 func gatewayWildcardTLSTargetForServer(
-	node *model.Proxy, server *networking.Server, routes []*networking.RouteDestination,
+	node *model.Proxy, server *networking.Server, routes []*networking.RouteDestination, namespace string,
 ) (gatewayWildcardTLSTarget, bool) {
 	if server.GetTls().GetMode() != networking.ServerTLSSettings_ISTIO_MUTUAL || protocol.Parse(server.GetPort().GetProtocol()) != protocol.TLS {
 		return gatewayWildcardTLSTarget{}, false
@@ -107,12 +139,45 @@ func gatewayWildcardTLSTargetForServer(
 	if svc == nil {
 		return gatewayWildcardTLSTarget{}, false
 	}
+	sniHosts := gatewayWildcardServerSNIHosts(server, namespace, svc.Hostname)
+	if len(sniHosts) == 0 {
+		log.Warnf("server hosts %v allow no SNI under the destination host %s, so the gateway does not forward to it",
+			server.Hosts, svc.Hostname)
+		return gatewayWildcardTLSTarget{}, false
+	}
 	return gatewayWildcardTLSTarget{
 		service:    svc,
 		port:       port,
 		dfpCluster: istio_route.GetDestinationCluster(routes[0].Destination, svc, int(server.GetPort().GetNumber())),
 		subset:     routes[0].Destination.GetSubset(),
+		sniHosts:   sniHosts,
 	}, true
+}
+
+// gatewayWildcardTLSSNIPredicate matches the SNIs of the target: exact for a host, and by suffix under a wildcard.
+func gatewayWildcardTLSSNIPredicate(sniHosts []string) *matcher.Matcher_MatcherList_Predicate {
+	predicates := slices.Map(sniHosts, func(h string) *matcher.Matcher_MatcherList_Predicate {
+		value := &matcher.StringMatcher{MatchPattern: &matcher.StringMatcher_Exact{Exact: h}}
+		if host.Name(h).IsWildCarded() {
+			value = &matcher.StringMatcher{MatchPattern: &matcher.StringMatcher_Suffix{Suffix: strings.TrimPrefix(h, "*")}}
+		}
+		return &matcher.Matcher_MatcherList_Predicate{
+			MatchType: &matcher.Matcher_MatcherList_Predicate_SinglePredicate_{
+				SinglePredicate: &matcher.Matcher_MatcherList_Predicate_SinglePredicate{
+					Input:   match.SNI,
+					Matcher: &matcher.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{ValueMatch: value},
+				},
+			},
+		}
+	})
+	if len(predicates) == 1 {
+		return predicates[0]
+	}
+	return &matcher.Matcher_MatcherList_Predicate{
+		MatchType: &matcher.Matcher_MatcherList_Predicate_OrMatcher{
+			OrMatcher: &matcher.Matcher_MatcherList_Predicate_PredicateList{Predicate: predicates},
+		},
+	}
 }
 
 // buildGatewayWildcardTLSFilters builds the network filters of the ISTIO_MUTUAL gateway chain, and records the target
@@ -156,7 +221,7 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSFilters(target gatewayWildcard
 
 // buildGatewayWildcardTLSInternalListener builds the internal listener of all targets, as the waypoint main_internal
 // listener. It restores the original addresses, reads the SNI of the application TLS, and selects the chain of the
-// target set by the gateway chain. Each chain accepts only SNIs under its wildcard host, applies AuthorizationPolicy
+// target set by the gateway chain. Each target accepts only the SNIs its server hosts allow, applies AuthorizationPolicy
 // with the peer identity from filter state, and resolves the SNI with the dynamic forward proxy. A connection without
 // a known target or with another SNI matches no chain and is closed.
 func (lb *ListenerBuilder) buildGatewayWildcardTLSInternalListener() *listener.Listener {
@@ -165,28 +230,21 @@ func (lb *ListenerBuilder) buildGatewayWildcardTLSInternalListener() *listener.L
 	// The authorization filters do not depend on the target, so they are built once for all chains.
 	authzFilters := authz.NewBuilder(authz.Custom, lb.push, lb.node, true).BuildTCP()
 	authzFilters = append(authzFilters, authz.NewBuilder(authz.Local, lb.push, lb.node, true).BuildTCP()...)
+	chainNames := sets.New[string]()
 	for _, target := range lb.gatewayWildcardTLSTargets {
-		chains = append(chains, &listener.FilterChain{
-			Name:    target.name(),
-			Filters: lb.buildGatewayWildcardTLSInternalFilters(target, authzFilters),
-		})
-		// As on sidecars, only SNIs under the wildcard host are forwarded.
+		// Servers with different hosts send to the same chain, as its filters only depend on the destination.
+		if !chainNames.InsertContains(target.name()) {
+			chains = append(chains, &listener.FilterChain{
+				Name:    target.name(),
+				Filters: lb.buildGatewayWildcardTLSInternalFilters(target, authzFilters),
+			})
+		}
+		// Only SNIs under the wildcard host that the server hosts allow are forwarded.
 		targets[target.key()] = match.ToMatcher(&matcher.Matcher{
 			MatcherType: &matcher.Matcher_MatcherList_{MatcherList: &matcher.Matcher_MatcherList{
 				Matchers: []*matcher.Matcher_MatcherList_FieldMatcher{{
-					Predicate: &matcher.Matcher_MatcherList_Predicate{
-						MatchType: &matcher.Matcher_MatcherList_Predicate_SinglePredicate_{
-							SinglePredicate: &matcher.Matcher_MatcherList_Predicate_SinglePredicate{
-								Input: match.SNI,
-								Matcher: &matcher.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
-									ValueMatch: &matcher.StringMatcher{
-										MatchPattern: &matcher.StringMatcher_Suffix{Suffix: strings.TrimPrefix(string(target.service.Hostname), "*")},
-									},
-								},
-							},
-						},
-					},
-					OnMatch: match.ToChain(target.name()),
+					Predicate: gatewayWildcardTLSSNIPredicate(target.sniHosts),
+					OnMatch:   match.ToChain(target.name()),
 				}},
 			}},
 		})

@@ -872,7 +872,7 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTCPRoutes(server *netwo
 		Port:     int(server.Port.Number),
 		Protocol: protocol.Parse(server.Port.Protocol),
 	}
-	if target, ok := gatewayWildcardTLSTargetForServer(lb.node, server, routes); ok {
+	if target, ok := gatewayWildcardTLSTargetForServer(lb.node, server, routes, configMeta.Namespace); ok {
 		return lb.buildGatewayWildcardTLSFilters(target, port)
 	}
 	includeMx := server.GetTls().GetMode() == networking.ServerTLSSettings_ISTIO_MUTUAL
@@ -983,11 +983,14 @@ func (lb *ListenerBuilder) buildGatewayNetworkFiltersFromTLSRoutes(server *netwo
 				for i, match := range tls.Match {
 					if l4SingleMatch(convertTLSMatchToL4Match(match), server, gatewayName) {
 						// The SNI dynamic forward proxy resolves any SNI that the chain matches, so the chain must only
-						// match SNIs under the wildcard host. Checked first, so a skipped rule does not reserve its SNIs.
-						if svc, _ := gatewayWildcardDestination(lb.node, tls.Route, port.Port); svc != nil && !sniHostsUnder(match.SniHosts, svc.Hostname) {
+						// match SNIs under the wildcard host that the server hosts allow. Checked first, so a skipped rule
+						// does not reserve its SNIs.
+						if svc, _ := gatewayWildcardDestination(lb.node, tls.Route, port.Port); svc != nil &&
+							!sniHostsUnder(match.SniHosts, gatewayWildcardServerSNIHosts(server, v.Namespace, svc.Hostname)) {
 							log.Warnf(
-								"skipping VirtualService %s rule #%v on server port %d of gateway %s, SNI host names %v are not all under the destination host %s",
-								v.Meta.Name, i, port.Port, gatewayName, match.SniHosts, svc.Hostname)
+								"skipping VirtualService %s rule #%v on server port %d of gateway %s, SNI host names %v are not all under "+
+									"the destination host %s and the server hosts %v",
+								v.Meta.Name, i, port.Port, gatewayName, match.SniHosts, svc.Hostname, server.Hosts)
 							model.RecordRejectedConfig(gatewayName)
 							continue
 						}

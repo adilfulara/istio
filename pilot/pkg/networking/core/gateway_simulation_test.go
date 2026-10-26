@@ -2818,6 +2818,71 @@ spec:
 				Error: simulation.ErrNoFilterChain,
 			},
 		}},
+	}, {
+		name: "tls passthrough route with SNI hosts wider than the gateway server hosts",
+		config: `
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: wildcard
+  namespace: default
+spec:
+  hosts:
+  - '*.destination1.com'
+  location: MESH_EXTERNAL
+  resolution: DYNAMIC_DNS
+  ports:
+  - number: 443
+    name: tls
+    protocol: TLS
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: egressgateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: egressgateway
+  servers:
+  - hosts:
+    - 'api.destination1.com'
+    port:
+      name: tls
+      number: 443
+      protocol: TLS
+    tls:
+      mode: PASSTHROUGH
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: wildcard
+  namespace: default
+spec:
+  gateways:
+  - istio-system/egressgateway
+  hosts:
+  - '*.destination1.com'
+  tls:
+  - match:
+    - port: 443
+      sniHosts:
+      - '*.destination1.com'
+    route:
+    - destination:
+        host: '*.destination1.com'
+        port:
+          number: 443
+`,
+		calls: []simulation.Expect{{
+			// The only rule is skipped, so the port has no listener.
+			Name: "host outside the server hosts",
+			Call: simulation.Call{Port: 443, Protocol: simulation.HTTP, TLS: simulation.TLS, HostHeader: "foo.destination1.com"},
+			Result: simulation.Result{
+				Error: simulation.ErrNoListener,
+			},
+		}},
 	}}
 	for _, tt := range cases {
 		runSimulationTest(t, egressGateway, xds.FakeOptions{}, tt)
