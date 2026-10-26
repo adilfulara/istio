@@ -1224,6 +1224,26 @@ func TestGatewayWildcardDynamicDNSServerHosts(t *testing.T) {
 			wantMutual:  []string{"exact:en.wikipedia.org"},
 		},
 		{
+			name:        "any-namespace server host narrower than the route",
+			serverHosts: []string{"*/en.wikipedia.org"},
+			vsHosts:     wildcard,
+			sniHosts:    wildcard,
+			wantMutual:  []string{"exact:en.wikipedia.org"},
+		},
+		{
+			name:        "current-namespace server host narrower than the route",
+			serverHosts: []string{"./en.wikipedia.org"},
+			vsHosts:     wildcard,
+			sniHosts:    wildcard,
+			wantMutual:  []string{"exact:en.wikipedia.org"},
+		},
+		{
+			name:        "server host in another namespace",
+			serverHosts: []string{"other/*.wikipedia.org"},
+			vsHosts:     wildcard,
+			sniHosts:    wildcard,
+		},
+		{
 			name:            "route SNI hosts within narrow server hosts",
 			serverHosts:     []string{"en.wikipedia.org", "*.m.wikipedia.org"},
 			vsHosts:         wildcard,
